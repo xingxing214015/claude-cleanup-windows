@@ -20,6 +20,9 @@ class CleanupTests(unittest.TestCase):
         local_patch = patch.dict(cleanup.os.environ, {'LOCALAPPDATA': str(self.home / 'AppData/Local')})
         local_patch.start()
         self.addCleanup(local_patch.stop)
+        idle_patch = patch.object(cleanup, 'ensure_idle', return_value=0)
+        idle_patch.start()
+        self.addCleanup(idle_patch.stop)
         self.cli = self.home / '.claude'
         self.cli.mkdir()
         (self.cli / 'cache').mkdir()
@@ -120,6 +123,105 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(after['projects'], before['projects'])
         self.assertNotIn('oauthAccount', after)
         self.assertEqual(json.loads((batch / 'snapshot/identity.json').read_text()), before)
+
+    def desktop_fixture(self):
+        package = {'Name': 'Claude', 'PackageFullName': 'Claude_1.0.0.0_x64__fixture',
+                   'PackageFamilyName': 'Claude_fixture'}
+        package_root = self.home / 'AppData/Local/Packages/Claude_fixture'
+        profile = package_root / 'LocalCache/Roaming/Claude'
+        profile.mkdir(parents=True)
+        (profile / 'claude_desktop_config.json').write_text('{"mcpServers":{}}')
+        (profile / 'Cookies').write_bytes(b'fixture login')
+        (profile / 'claude-code-sessions').mkdir()
+        (profile / 'claude-code-sessions/history').write_text('desktop fixture session')
+        state = package_root / 'LocalState'
+        state.mkdir()
+        (state / 'fixture').write_bytes(b'state')
+        legacy = self.roaming / 'Claude'
+        legacy.mkdir(parents=True)
+        (legacy / 'config.json').write_text('{"fixture":true}')
+        (package_root / 'other-package-data').write_bytes(b'additional backup')
+        return package, package_root, profile, legacy
+
+    def test_desktop_reset_backs_up_complete_profiles_and_keeps_cli_history(self):
+        package, root, profile, legacy = self.desktop_fixture()
+        with patch.object(cleanup, 'installed_packages', return_value=[package]):
+            targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False, 'reset')
+            self.assertNotIn(profile, targets)  # Parent LocalCache moves as one unit.
+            batch = cleanup.execute(self.home, self.roaming, targets, None, desktop='reset')
+        self.assertFalse(profile.exists())
+        self.assertFalse(legacy.exists())
+        self.assertFalse((root / 'LocalState').exists())
+        self.assertEqual((self.cli / 'projects/history').read_text(), 'keep')
+        self.assertEqual(cleanup.read_settings(self.cli / 'settings.json'), self.settings)
+        record = json.loads((batch / 'plan.json').read_text())
+        for item in record['moves']:
+            self.assertTrue(Path(item['destination']).exists())
+        self.assertTrue(any(p.read_bytes() == b'fixture login' for p in (batch / 'snapshot').rglob('Cookies')))
+        self.assertTrue(any(p.read_text() == 'desktop fixture session' for p in (batch / 'snapshot/desktop').rglob('history')))
+
+    def test_complete_profile_requires_explicit_reset(self):
+        _, _, profile, legacy = self.desktop_fixture()
+        with self.assertRaises(RuntimeError):
+            cleanup.execute(self.home, self.roaming, [legacy], None)
+        self.assertTrue(profile.exists())
+        self.assertFalse((self.home / 'ClaudeCleanupBackups').exists())
+
+    def test_uninstall_only_after_verified_complete_package_backup(self):
+        package, root, _, _ = self.desktop_fixture()
+        observed = []
+        def uninstall(selected):
+            batches = list((self.home / 'ClaudeCleanupBackups').iterdir())
+            snapshot = batches[0] / 'snapshot/packages/Claude_fixture'
+            self.assertEqual((snapshot / 'other-package-data').read_bytes(), b'additional backup')
+            self.assertTrue((snapshot / 'LocalCache/Roaming/Claude/Cookies').exists())
+            observed.append(selected)
+        with patch.object(cleanup, 'installed_packages', return_value=[package]), \
+                patch.object(cleanup, 'uninstall_package', side_effect=uninstall):
+            targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False, 'uninstall')
+            batch = cleanup.execute(self.home, self.roaming, targets, None, desktop='uninstall')
+        self.assertEqual(observed, [package])
+        self.assertEqual(json.loads((batch / 'plan.json').read_text())['status'], 'complete')
+
+    def test_uninstall_backup_failure_never_calls_windows_uninstaller(self):
+        package, _, profile, _ = self.desktop_fixture()
+        with patch.object(cleanup, 'installed_packages', return_value=[package]), \
+                patch.object(cleanup, 'uninstall_package') as uninstall, \
+                patch.object(cleanup.shutil, 'copytree', side_effect=OSError('disk full')):
+            targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False, 'uninstall')
+            with self.assertRaises(OSError):
+                cleanup.execute(self.home, self.roaming, targets, None, desktop='uninstall')
+        uninstall.assert_not_called()
+        self.assertTrue(profile.exists())
+
+    def test_uninstall_failure_reports_partial_state_and_retains_recovery_data(self):
+        package, _, _, _ = self.desktop_fixture()
+        with patch.object(cleanup, 'installed_packages', return_value=[package]), \
+                patch.object(cleanup, 'uninstall_package', side_effect=RuntimeError('fixture failure')):
+            targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False, 'uninstall')
+            with self.assertRaises(RuntimeError):
+                cleanup.execute(self.home, self.roaming, targets, None, desktop='uninstall')
+        batch = next((self.home / 'ClaudeCleanupBackups').iterdir())
+        self.assertEqual(json.loads((batch / 'plan.json').read_text())['status'], 'backed-up')
+        self.assertTrue((batch / 'snapshot/packages/Claude_fixture/LocalState/fixture').exists())
+        self.assertTrue((batch / 'quarantine').exists())
+
+    def test_unknown_installer_or_package_changes_stop_before_writes(self):
+        with patch.object(cleanup, 'installed_packages', return_value=[]):
+            with self.assertRaises(RuntimeError):
+                cleanup.execute(self.home, self.roaming, [], None, desktop='uninstall')
+        with patch.object(cleanup, 'installed_packages', return_value=[{'Name': 'new'}]):
+            with self.assertRaises(RuntimeError):
+                cleanup.execute(self.home, self.roaming, [], None, desktop='reset', expected_packages=[])
+        self.assertFalse((self.home / 'ClaudeCleanupBackups').exists())
+
+    def test_running_app_blocks_reset_before_backup(self):
+        with patch.object(cleanup, 'installed_packages', return_value=[]), \
+                patch.object(cleanup, 'ensure_idle', side_effect=RuntimeError('app running')):
+            targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False, 'reset')
+            with self.assertRaises(RuntimeError):
+                cleanup.execute(self.home, self.roaming, targets, None, desktop='reset')
+        self.assertFalse((self.home / 'ClaudeCleanupBackups').exists())
 
 
 if __name__ == '__main__':
