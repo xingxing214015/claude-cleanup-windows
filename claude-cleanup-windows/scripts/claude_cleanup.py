@@ -15,9 +15,13 @@ import sys
 import uuid
 
 
-CLI_CACHES = ("cache", "stats-cache.json", "telemetry", "usage-data",
+CLI_CACHES = ("cache", "stats-cache.json", "telemetry",
               "usage.jsonl", "usage.with-fix.jsonl")
+# usage-data contains saved /insights reports, not disposable cache.
 DESKTOP_CACHES = ("Cache", "Code Cache", "GPUCache", "DawnCache", "logs", "Crashpad")
+PACKAGE_NAMES = ("Claude", "Anthropic.Claude", "AnthropicPBC.Claude")
+PACKAGE_PREFIX = "(?:" + "|".join(re.escape(name) for name in PACKAGE_NAMES) + ")"
+PACKAGE_FAMILY = PACKAGE_PREFIX + r"_[a-z0-9]+"
 ACCOUNT_CACHE_KEYS = {
     "additionalModelCostsCache", "additionalModelOptionsCache", "anonymousId",
     "autoCompactWindowsCache", "cachedChromeExtensionInstalled", "cachedDynamicConfigs",
@@ -111,11 +115,18 @@ def desktop_roots(locations: dict[str, Path]) -> list[Path]:
     local = locations["local"]
     found = [locations["desktop"], locations["desktop"].with_name("Claude-3p"),
              local / "Claude-3p"]
+    # New Desktop builds move userData out of MSIX virtualization. Discover
+    # only known family-shaped children, including leftovers after an OS reset.
+    # Do not follow .user-data-left contents or remove Claude-Data itself/README.
+    migrated = local / "Claude-Data"
+    if migrated.exists():
+        found.extend(path for path in migrated.iterdir()
+                     if re.fullmatch(PACKAGE_FAMILY, path.name, re.I))
     packages = local / "Packages"
     # Only inspect known Claude package-family names, never delete package roots.
     if packages.exists():
         for package in packages.iterdir():
-            if re.fullmatch(r"(?:Claude|Anthropic\.Claude)_[a-z0-9]+", package.name, re.I):
+            if re.fullmatch(PACKAGE_FAMILY, package.name, re.I):
                 for parent in ("Roaming", "Local"):
                     found.extend(package / "LocalCache" / parent / name
                                  for name in ("Claude", "Claude-3p"))
@@ -123,18 +134,19 @@ def desktop_roots(locations: dict[str, Path]) -> list[Path]:
 
 
 def installed_packages() -> list[dict]:
+    names = ",".join("'" + name + "'" for name in PACKAGE_NAMES)
     command = ("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
-               "@(Get-AppxPackage | Where-Object { $_.Name -in @('Claude','Anthropic.Claude') } | "
+               "@(Get-AppxPackage | Where-Object { $_.Name -in @(" + names + ") } | "
                "Select-Object Name,PackageFullName,PackageFamilyName) | ConvertTo-Json -Compress")
     result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
                             capture_output=True, check=True)
     data = json.loads(result.stdout.decode("utf-8-sig").strip() or "[]")
     packages = data if isinstance(data, list) else [data]
     for package in packages:
-        if (package.get("Name") not in {"Claude", "Anthropic.Claude"}
-                or not re.fullmatch(r"(?:Claude|Anthropic\.Claude)_[a-z0-9]+",
+        if (package.get("Name") not in PACKAGE_NAMES
+                or not re.fullmatch(PACKAGE_FAMILY,
                                     package.get("PackageFamilyName", ""), re.I)
-                or not re.fullmatch(r"(?:Claude|Anthropic\.Claude)_[a-zA-Z0-9_.-]+",
+                or not re.fullmatch(PACKAGE_PREFIX + r"_[a-zA-Z0-9_.-]+",
                                     package.get("PackageFullName", ""))):
             raise RuntimeError("Unexpected Claude package identity; refusing uninstall/reset")
     return packages

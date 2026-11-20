@@ -223,6 +223,143 @@ class CleanupTests(unittest.TestCase):
                 cleanup.execute(self.home, self.roaming, targets, None, desktop='reset')
         self.assertFalse((self.home / 'ClaudeCleanupBackups').exists())
 
+    def migrated_fixture(self, family='claude_pzs8sxrjxfjjc'):
+        profile = self.home / 'AppData/Local/Claude-Data' / family
+        (profile / 'Cache').mkdir(parents=True)
+        (profile / 'Cache/data').write_bytes(b'migrated cache')
+        (profile / 'logs').mkdir()
+        (profile / 'logs/main.log').write_text('fixture log')
+        (profile / 'Cookies').write_bytes(b'migrated login')
+        (profile / 'claude-code-sessions').mkdir()
+        (profile / 'claude-code-sessions/history').write_text('migrated history')
+        return profile
+
+    def test_migrated_cache_cleanup_preserves_login_sessions_and_other_data(self):
+        profile = self.migrated_fixture()
+        parent = profile.parent
+        (parent / 'README').write_text('keep parent metadata')
+        other = parent / 'Other_fixture/Cache'
+        other.mkdir(parents=True)
+        (other / 'data').write_bytes(b'unrelated cache')
+        targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False)
+        batch = cleanup.execute(self.home, self.roaming, targets, None)
+        self.assertFalse((profile / 'Cache').exists())
+        self.assertFalse((profile / 'logs').exists())
+        self.assertEqual((profile / 'Cookies').read_bytes(), b'migrated login')
+        self.assertEqual((profile / 'claude-code-sessions/history').read_text(), 'migrated history')
+        self.assertTrue((parent / 'README').exists())
+        self.assertEqual((other / 'data').read_bytes(), b'unrelated cache')
+        self.assertTrue(any(p.read_bytes() == b'migrated cache'
+                            for p in (batch / 'snapshot/desktop').rglob('data')))
+
+    def test_migrated_reset_without_registered_package_or_cli_has_full_recovery(self):
+        import shutil
+        profile = self.migrated_fixture()
+        shutil.rmtree(self.cli)  # Isolated fixture: Desktop-only installation.
+        marker = self.home / 'AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude'
+        marker.mkdir(parents=True)
+        (marker / '.user-data-left.claude_pzs8sxrjxfjjc').touch()
+        with patch.object(cleanup, 'installed_packages', return_value=[]):
+            targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False, 'reset')
+            self.assertIn(profile, targets)
+            batch = cleanup.execute(self.home, self.roaming, targets, None, desktop='reset')
+        self.assertFalse(profile.exists())
+        record = json.loads((batch / 'plan.json').read_text())
+        saved = next(Path(item['snapshot']) for item in record['snapshots'] if item['source'] == str(profile))
+        self.assertEqual((saved / 'Cookies').read_bytes(), b'migrated login')
+        self.assertEqual((saved / 'claude-code-sessions/history').read_text(), 'migrated history')
+        # Restore using the public manifest, independently of discovery logic.
+        for item in record['moves']:
+            destination = Path(item['source'])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(item['destination'], destination)
+        self.assertEqual((profile / 'Cookies').read_bytes(), b'migrated login')
+        self.assertTrue((marker / '.user-data-left.claude_pzs8sxrjxfjjc').exists())
+
+    def test_migrated_uninstall_backs_up_external_profile_before_system_call(self):
+        package, _, _, _ = self.desktop_fixture()
+        profile = self.migrated_fixture('claude_fixture')
+        observed = []
+        def uninstall(selected):
+            batch = next((self.home / 'ClaudeCleanupBackups').iterdir())
+            record = json.loads((batch / 'plan.json').read_text())
+            saved = next(Path(item['snapshot']) for item in record['snapshots'] if item['source'] == str(profile))
+            self.assertEqual((saved / 'Cookies').read_bytes(), b'migrated login')
+            self.assertTrue((batch / 'snapshot/packages/Claude_fixture/other-package-data').exists())
+            observed.append(selected)
+        with patch.object(cleanup, 'installed_packages', return_value=[package]), \
+                patch.object(cleanup, 'uninstall_package', side_effect=uninstall):
+            targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False, 'uninstall')
+            batch = cleanup.execute(self.home, self.roaming, targets, None, desktop='uninstall')
+        self.assertEqual(observed, [package])
+        self.assertFalse(profile.exists())
+        self.assertEqual(json.loads((batch / 'plan.json').read_text())['status'], 'complete')
+
+    def test_migrated_backup_failure_keeps_external_profile(self):
+        profile = self.migrated_fixture()
+        original_copy = cleanup.shutil.copytree
+        def copy(source, destination, *args, **kwargs):
+            if Path(source) == profile:
+                raise OSError('simulated migrated profile backup failure')
+            return original_copy(source, destination, *args, **kwargs)
+        with patch.object(cleanup, 'installed_packages', return_value=[]), \
+                patch.object(cleanup.shutil, 'copytree', side_effect=copy):
+            targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False, 'reset')
+            with self.assertRaises(OSError):
+                cleanup.execute(self.home, self.roaming, targets, None, desktop='reset')
+        self.assertEqual((profile / 'Cookies').read_bytes(), b'migrated login')
+        self.assertTrue((self.cli / 'cache/data').exists())
+
+    def test_migrated_parent_and_unknown_children_cannot_be_reset(self):
+        profile = self.migrated_fixture()
+        other = profile.parent / 'Other_fixture'
+        other.mkdir()
+        with patch.object(cleanup, 'installed_packages', return_value=[]):
+            for target in (profile.parent, other):
+                with self.assertRaises(RuntimeError):
+                    cleanup.execute(self.home, self.roaming, [target], None, desktop='reset')
+        self.assertFalse((self.home / 'ClaudeCleanupBackups').exists())
+
+    def test_migrated_junction_is_refused_before_backup(self):
+        import subprocess
+        outside = self.home / 'outside'
+        (outside / 'Cache').mkdir(parents=True)
+        parent = self.home / 'AppData/Local/Claude-Data'
+        parent.mkdir(parents=True)
+        link = parent / 'claude_fixture'
+        result = subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(outside)], capture_output=True)
+        if result.returncode:
+            self.skipTest('Junction creation unavailable')
+        try:
+            with self.assertRaises(RuntimeError):
+                cleanup.candidates(cleanup.roots(self.home, self.roaming), False)
+            self.assertFalse((self.home / 'ClaudeCleanupBackups').exists())
+        finally:
+            link.rmdir()
+
+    def test_publisher_variant_is_supported_in_new_and_old_layouts(self):
+        import subprocess
+        profile = self.migrated_fixture('anthropicpbc.claude_fnn82j28hfe8t')
+        package = {'Name': 'AnthropicPBC.Claude',
+                   'PackageFullName': 'AnthropicPBC.Claude_1.0.0.0_x64__fnn82j28hfe8t',
+                   'PackageFamilyName': 'AnthropicPBC.Claude_fnn82j28hfe8t'}
+        response = subprocess.CompletedProcess([], 0, json.dumps([package]).encode(), b'')
+        with patch.object(cleanup.subprocess, 'run', return_value=response):
+            self.assertEqual(cleanup.installed_packages(), [package])
+        old_cache = self.home / 'AppData/Local/Packages' / package['PackageFamilyName'] / 'LocalCache/Roaming/Claude/Cache'
+        old_cache.mkdir(parents=True)
+        targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False)
+        self.assertIn(profile / 'Cache', targets)
+        self.assertIn(old_cache, targets)
+
+    def test_insights_reports_survive_default_cleanup(self):
+        reports = self.cli / 'usage-data'
+        reports.mkdir()
+        (reports / 'report.html').write_text('saved insights report')
+        targets = cleanup.candidates(cleanup.roots(self.home, self.roaming), False)
+        cleanup.execute(self.home, self.roaming, targets, None)
+        self.assertEqual((reports / 'report.html').read_text(), 'saved insights report')
+
 
 if __name__ == '__main__':
     unittest.main()

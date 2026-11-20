@@ -33,13 +33,18 @@ python scripts/claude_cleanup.py --desktop uninstall
 
 仅支持脚本中固定白名单。CLI 的历史、项目、skills、plugins、MCP 和其他配置受保护；只有明确选择的设置键及身份文件允许结构化修改。不打印秘密，不改遥测设置，也不读取或改写全局环境变量。`CLAUDE_CONFIG_DIR` 有值时停止，避免清错配置。遇到符号链接或 Windows junction/reparse point 停止，不跟随它们复制或移动。进程检查失败时停止写入。脚本不结束进程。
 
-Desktop 缓存目录包括 `%APPDATA%\Claude`、相邻的 `Claude-3p`、`%LOCALAPPDATA%\Claude-3p`，以及 `%LOCALAPPDATA%\Packages` 中实际存在的 `Claude_<发布者ID>` / `Anthropic.Claude_<发布者ID>` 下 `LocalCache\Roaming` 或 `LocalCache\Local` 中的同名目录。默认 `--desktop keep` 只移动这些目录中的 `Cache`、`Code Cache`、`GPUCache`、`DawnCache`、`logs`、`Crashpad`。未知安装布局先通过应用的日志/配置位置确认，不扩展通配删除范围。
+Desktop 数据目录包括 `%APPDATA%\Claude`、相邻的 `Claude-3p`、`%LOCALAPPDATA%\Claude-3p`，以及以下布局：
+
+- 旧 MSIX：`%LOCALAPPDATA%\Packages\<包族名>\LocalCache\Roaming\Claude` 或 `LocalCache\Local\Claude`，也识别对应的 `Claude-3p`。
+- 新版迁移目录：`%LOCALAPPDATA%\Claude-Data\<包族名>`，例如 `claude_pzs8sxrjxfjjc`。包族名仅接受 `Claude_<发布者ID>`、`Anthropic.Claude_<发布者ID>`、`AnthropicPBC.Claude_<发布者ID>`（不区分大小写）。即使应用重置后未注册软件包，也能识别遗留数据。
+
+默认 `--desktop keep` 只移动上述目录中的 `Cache`、`Code Cache`、`GPUCache`、`DawnCache`、`logs`、`Crashpad`，保留登录和本地会话。旧目录仅剩 `.user-data-left…` 标记不代表新目录已清空；不将标记内容作为任意路径执行。保留 `Claude-Data` 根目录、README 和其他不匹配的子目录。未知安装布局先通过应用的日志/配置位置确认，不扩展通配删除范围。CLI 的 `usage-data` 是 `/insights` 报告目录，不自动清理。
 
 ## 桌面端完整重置与卸载
 
-- `--desktop reset`：完整备份、校验后隔离上述桌面端数据目录；对 `Get-AppxPackage` 查询确认的当前用户 Claude 软件包，还处理其 `LocalCache`、`LocalState`、`RoamingState`、`Settings`、`TempState`。重叠路径只处理上层一次。保留应用安装，不触碰用户 `.claude` 中的历史、skills 和其他保护项。
+- `--desktop reset`：完整备份、校验后隔离上述桌面端数据目录（包括新版 `Claude-Data` 下匹配的完整用户数据）；对 `Get-AppxPackage` 查询确认的当前用户 Claude 软件包，还处理其 `LocalCache`、`LocalState`、`RoamingState`、`Settings`、`TempState`。重叠路径只处理上层一次。保留应用安装，不触碰用户 `.claude` 中的历史、skills 和其他保护项。
 - 完整重置会移走桌面端登录状态、MCP 配置、扩展、本地 Claude Code/Cowork 会话及工作数据。必须在最终清单中说明这个范围，不能将它描述为仅清理可再生缓存。云端账号、订阅、云端聊天及服务端会话不在处理范围，不宣称撤销服务端令牌。
-- `--desktop uninstall`：包含完整重置，并在完整备份软件包用户数据后，对精确匹配的当前用户 `Claude` / `Anthropic.Claude` 包运行 `Remove-AppxPackage`，随后再次查询确认。仅处理当前用户；不使用 `-AllUsers`，不移除其他用户或企业预配安装，不手动删除 `WindowsApps`。未识别到支持的 MSIX 包时停止，不能把清缓存报告为卸载成功。旧式安装须另行确认其官方卸载入口。
+- `--desktop uninstall`：包含完整重置，并在完整备份软件包用户数据和包外迁移数据后，对精确匹配的当前用户 `Claude` / `Anthropic.Claude` / `AnthropicPBC.Claude` 包运行 `Remove-AppxPackage`，随后再次查询确认。仅处理当前用户；不使用 `-AllUsers`，不移除其他用户或企业预配安装，不手动删除 `WindowsApps`。未识别到支持的 MSIX 包时停止，不能把清缓存报告为卸载成功。旧式安装须另行确认其官方卸载入口。
 - 卸载具有系统注册信息变更，无法仅通过移回文件恢复应用安装。恢复时先用官方安装器重新安装，退出应用，再按备份清单恢复所需数据。被 Windows 锁定的文件、权限异常或备份校验失败均停止；不自动结束进程或提升权限。
 - `plan.json` 列出每个原始目录与快照位置、隔离移动、软件包身份及最终状态。`progress.json` 与 `uninstall-progress.json` 记录最近完成操作；状态未标记 `complete` 时报告部分完成并保留批次。
 

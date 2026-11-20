@@ -3,6 +3,10 @@
 Claude Code / Claude Desktop 的 Windows 原生清理技能，参考
 [Suyuan 的 macOS 版](https://github.com/suyuan2022/suyuan-skill/tree/main/claude-cleanup)实现。
 
+当前版本：**v1.1.0**。新增识别 `%LOCALAPPDATA%\Claude-Data\claude_…` 等已知包族的数据目录，适配新版桌面端迁移后的缓存清理、完整重置和卸载前备份。保留根目录 README 和其他不匹配的数据；CLI `/insights` 报告也不再作为缓存清理。
+
+[下载 v1.1.0 技能包](https://github.com/xingxing214015/claude-cleanup-windows/releases/tag/v1.1.0)。
+
 ## 在其他电脑安装
 
 在 Codex 中发送以下指令，无需手动下载 ZIP：
@@ -18,7 +22,7 @@ Windows 原生 Python 3.10+，脚本无需第三方依赖；不适用于 WSL。
 ## 功能
 
 - 只读审计、完整 SHA-256 校验备份、可恢复的缓存隔离。
-- 识别传统 Desktop 数据目录及 Claude MSIX 软件包内的缓存。
+- 识别传统 Desktop、Claude MSIX 软件包内目录及新版包外 `Claude-Data` 数据。
 - 可选 CLI 文件凭据重置、本地 userID/machineID 轮换和精简模式设置。
 - 默认缓存清理保留历史、skills、plugins 和 MCP；CLI 保护范围与遥测设置始终保持。
 - `--desktop reset` 完整备份后重置桌面端登录、配置、扩展及本地会话。
@@ -45,8 +49,9 @@ python .\claude-cleanup-windows\scripts\claude_cleanup.py --desktop uninstall
 python -X utf8 .\test_claude_cleanup_windows.py
 ```
 
-15 项隔离测试覆盖完整桌面重置、备份失败、卸载调用顺序与失败恢复、保护路径、
-Windows junction、MSIX 缓存、凭据选择、进程识别、设置保留和本地 ID 轮换。
+23 项隔离测试覆盖新旧数据目录、仅安装桌面端时的重置和按清单恢复、完整备份失败、
+卸载调用顺序与失败恢复、保护路径、Windows junction、MSIX 缓存、凭据选择、
+进程识别、设置保留、本地 ID 轮换和 `/insights` 报告保留。
 卸载系统调用使用模拟验证；未执行真实清理或真实卸载。
 
 完整重置会移走桌面端 MCP 配置、扩展和本地 Claude Code/Cowork 数据；
